@@ -1,25 +1,26 @@
-# Variables
 PYTHON = python3
-PIP = pip3
-SRC_DIR = src
-MAIN = $(SRC_DIR)/main.py
+MAIN = src/main.py
+LINT_DIRS = src/
 
-.PHONY: install run debug clean lint
+.PHONY: all run lint clean fclean re
 
-install:
-	$(PIP) install -r requirements.txt
+all:
+	@echo "Rien à compiler (Python). Utilisez 'make run ARGS=\"chemin/carte.txt\"' ou 'make lint'."
 
 run:
 	$(PYTHON) $(MAIN) $(ARGS)
 
-debug:
-	$(PYTHON) -m pdb $(MAIN) $(ARGS)
+lint:
+	@echo "Vérification avec flake8..."
+	flake8 $(LINT_DIRS)
+	@echo "Vérification du typage strict avec mypy..."
+	mypy --strict $(MAIN)
 
 clean:
+	find . -type f -name "*.pyc" -delete
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	find . -type d -name ".mypy_cache" -exec rm -rf {} +
-	rm -rf .pytest_cache
 
-lint:
-	flake8 .
-	mypy --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs .
+fclean: clean
+
+re: clean all

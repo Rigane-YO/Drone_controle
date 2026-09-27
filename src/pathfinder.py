@@ -44,7 +44,6 @@ class Pathfinder:
             paths.append(path)
             
             # On exclut les nœuds intermédiaires de ce chemin pour les recherches suivantes
-            # (Le start et le end restent toujours disponibles)
             for node in path[1:-1]:
                 excluded_nodes.add(node)
                 
