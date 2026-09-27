@@ -6,6 +6,7 @@ from typing import NoReturn
 from parser import GraphParser, ParsingError
 from graph import NetworkGraph
 from pathfinder import Pathfinder
+from simulation import Simulator
 
 def main() -> None:
     # 1. Configuration des arguments
@@ -23,11 +24,11 @@ def main() -> None:
         graph_parser.parse()
         print("✓ Carte chargée avec succès !")
     except ParsingError as e:
-        exit_error(f"Erreur de syntaxe :\n{e}")
+        exit_error(f" Erreur de syntaxe :\n{e}")
     except FileNotFoundError:
-        exit_error(f"Fichier introuvable : {args.map_file}")
+        exit_error(f" Fichier introuvable : {args.map_file}")
     except Exception as e:
-        exit_error(f"Erreur inattendue :\n{e}")
+        exit_error(f" Erreur inattendue :\n{e}")
 
     # Vérification de sécurité pour le typage strict (mypy)
     if not graph_parser.start_hub or not graph_parser.end_hub:
@@ -45,9 +46,22 @@ def main() -> None:
 
     if best_path:
         print(f"✓ Chemin optimal trouvé : {' -> '.join(best_path)}")
-        print(f"  Nombre d'étapes : {len(best_path)}")
+        print(f"  Nombre d'étapes : {len(best_path)}\n")
+        
+        # 5. Exécution de la simulation
+        print("--- Début de la simulation ---")
+        simulator = Simulator(
+            graph=network,
+            start_hub=graph_parser.start_hub,
+            end_hub=graph_parser.end_hub,
+            nb_drones=graph_parser.nb_drones,
+            best_path=best_path
+        )
+        simulator.run()
+        print(f"--- Simulation terminée en {simulator.turn} tours ---")
+        
     else:
-        print("Aucun chemin possible vers la destination !")
+        print("❌ Aucun chemin possible vers la destination !")
 
 def exit_error(message: str) -> NoReturn:
     """Affiche un message d'erreur et quitte le programme proprement."""

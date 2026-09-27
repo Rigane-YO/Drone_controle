@@ -21,6 +21,15 @@ class Connection:
 @dataclass
 class Drone:
     id:str
-    current_locatioon:str
+    current_location:str
     path:List[str] = field(default_factory=list)
     status:str = "waiting"
+
+@dataclass
+class Drone:
+    """Représente un drone individuel dans la simulation."""
+    id: str
+    current_location: str
+    path: List[str] = field(default_factory=list)
+    status: str = "waiting"
+    turns_spent_in_zone: int = 0

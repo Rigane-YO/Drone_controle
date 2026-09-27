@@ -6,6 +6,7 @@ from .models import Zone, Connection, Drone
 from .parser import GraphParser, ParsingError
 from .graph import NetworkGraph
 from .pathfinder import Pathfinder
+from .simulation import Simulator
 
 __all__ = [
     "Zone",
@@ -14,5 +15,6 @@ __all__ = [
     "GraphParser",
     "ParsingError",
     "NetworkGraph",
-    "Pathfinder"
+    "Pathfinder",
+    "Simulator"
 ]
