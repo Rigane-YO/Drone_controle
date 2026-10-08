@@ -7,8 +7,8 @@ from models import Drone
 class Simulator:
     """Simule les drones en respectant les capacités des zones et des liaisons.
 
-    Les déplacements sont traités dans un ordre déterministe : chemin restant le
-    plus court, puis identifiant du drone. Une liaison physique ne peut être
+    Les déplacements sont traités dans un ordre déterministe : chemin restant
+    le plus court, puis identifiant du drone. Une liaison physique ne peut être
     empruntée qu'un nombre de fois égal à sa capacité pendant un même tour,
     quel que soit le sens du déplacement.
     """
@@ -46,8 +46,6 @@ class Simulator:
             for index, path in enumerate(paths, 1)
         ]
 
-        # Répartition équilibrée : on privilégie le chemin le plus court et le
-        # moins chargé. On retire le hub de départ, déjà occupé initialement.
         path_loads = [0] * len(validated_paths)
         path_assignments: List[List[str]] = []
         for _ in range(nb_drones):
@@ -85,6 +83,8 @@ class Simulator:
             raise ValueError(
                 f"Le chemin {path_number} doit se terminer par '{self.end_hub}'."
             )
+        if len(set(path)) != len(path):
+            raise ValueError(f"Le chemin {path_number} contient un cycle.")
 
         for zone_name in path:
             if zone_name not in self.graph.zones:
@@ -110,39 +110,39 @@ class Simulator:
         return list(path)
 
     def is_finished(self) -> bool:
-        """Retourne True si tous les drones sont livrés (y compris zéro drone)."""
+        """Retourne True si tous les drones sont livrés."""
         return all(drone.status == "delivered" for drone in self.drones)
 
-    def run(self) -> bool:
-        """Exécute la simulation et retourne True uniquement si elle est terminée.
+    def step(self) -> List[str]:
+        """Avance d'un tour; renvoie les mouvements et signale un deadlock.
 
-        La simulation s'arrête dès qu'aucun mouvement ni attente réglementaire
-        n'est possible. Cela évite les boucles infinies en cas de deadlock.
+        Cette méthode commune est utilisée par le mode console et la vue 3D,
+        de manière à appliquer la même détection de blocage aux deux interfaces.
         """
-        while not self.is_finished():
-            self.turn += 1
-            moves_this_turn = self._simulate_turn()
+        if self.is_finished() or self.deadlocked:
+            return []
 
+        self.turn += 1
+        moves = self._simulate_turn()
+        if not moves and not self.is_finished() and not self._waited_this_turn:
+            self.deadlocked = True
+            if self.error is None:
+                self.error = (
+                    f"Deadlock détecté au tour {self.turn} : "
+                    "aucun mouvement possible."
+                )
+        return moves
+
+    def run(self) -> bool:
+        """Exécute la simulation et retourne True uniquement en cas de succès."""
+        while not self.is_finished() and not self.deadlocked:
+            moves_this_turn = self.step()
             if moves_this_turn:
                 print(" ".join(moves_this_turn))
-                continue
 
-            if self.is_finished():
-                break
-
-            # Un drone peut ne pas bouger pendant un tour parce qu'il termine son
-            # délai obligatoire dans une zone restreinte. Ce cas est temporaire.
-            if self._waited_this_turn:
-                continue
-
-            self.deadlocked = True
-            self.error = (
-                f"Deadlock détecté au tour {self.turn} : "
-                "aucun mouvement possible."
-            )
-            print(f"Error: {self.error}")
+        if self.deadlocked:
+            print(f"Error: {self.error or 'Deadlock détecté.'}")
             return False
-
         return self.is_finished()
 
     @staticmethod
@@ -156,7 +156,6 @@ class Simulator:
         self._waited_this_turn = False
         link_usage: Dict[Tuple[str, str], int] = {}
 
-        # Ordre stable : un drone proche de sa destination passe en premier.
         drones_to_process = sorted(
             (drone for drone in self.drones if drone.status != "delivered"),
             key=lambda drone: (len(drone.path), drone.id),
@@ -171,8 +170,8 @@ class Simulator:
                 )
                 continue
 
-            # Entrer dans une zone restreinte compte comme le premier tour.
-            # Le drone attend un tour supplémentaire, puis peut repartir.
+            # Entrer dans une zone restreinte compte comme le premier tour;
+            # le drone attend un tour supplémentaire avant de repartir.
             if current_zone.zone_type == "restricted" and drone.turns_spent_in_zone < 2:
                 drone.turns_spent_in_zone += 1
                 self._waited_this_turn = True
@@ -204,8 +203,6 @@ class Simulator:
             if link_capacity <= 0 or link_usage.get(link, 0) >= link_capacity:
                 continue
 
-            # Le hub d'arrivée accepte tous les drones ; les autres zones
-            # respectent strictement max_drones.
             if (
                 next_target != self.end_hub
                 and self.zone_occupancy[next_target] >= target_zone.max_drones
@@ -213,6 +210,13 @@ class Simulator:
                 continue
 
             origin = drone.current_location
+            if self.zone_occupancy.get(origin, 0) <= 0:
+                self.error = (
+                    f"Occupation incohérente : la zone '{origin}' ne contient "
+                    f"aucun drone alors que {drone.id} s'y trouve."
+                )
+                continue
+
             self.zone_occupancy[origin] -= 1
             drone.current_location = next_target
             drone.path.pop(0)
