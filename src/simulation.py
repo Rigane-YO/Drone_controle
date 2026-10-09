@@ -46,15 +46,27 @@ class Simulator:
             for index, path in enumerate(paths, 1)
         ]
 
+        # Estime la latence et le débit utile de chaque route. Le débit est
+        # borné par les liaisons et les zones internes; une zone restreinte
+        # ajoute un tour d'attente et espace les lots sur deux tours.
+        path_metrics = [self._path_metrics(path) for path in validated_paths]
         path_loads = [0] * len(validated_paths)
         path_assignments: List[List[str]] = []
         for _ in range(nb_drones):
             best_path_idx = min(
                 range(len(validated_paths)),
-                key=lambda idx: len(validated_paths[idx]) + path_loads[idx],
+                key=lambda idx: self._projected_finish(
+                    idx, path_loads, path_metrics
+                ),
             )
             path_assignments.append(validated_paths[best_path_idx][1:])
             path_loads[best_path_idx] += 1
+
+        # Garder l'affectation accessible facilite le diagnostic et les tests.
+        self.path_assignments: List[List[str]] = [
+            list(path) for path in path_assignments
+        ]
+        self.path_loads: List[int] = list(path_loads)
 
         self.drones: List[Drone] = [
             Drone(
@@ -70,6 +82,53 @@ class Simulator:
             zone_name: 0 for zone_name in graph.zones
         }
         self.zone_occupancy[start_hub] = nb_drones
+
+    @staticmethod
+    def _projected_finish(
+        index: int,
+        path_loads: List[int],
+        path_metrics: List[Tuple[int, int, int]],
+    ) -> Tuple[int, int, float, int]:
+        """Classe une route selon le temps d'arrivée estimé du prochain drone."""
+        latency, throughput, cadence = path_metrics[index]
+        projected_load = path_loads[index] + 1
+        finish_turn = latency + cadence * ((projected_load - 1) // throughput)
+        utilization = path_loads[index] / throughput
+        return finish_turn, latency, utilization, index
+
+    def _path_metrics(self, path: List[str]) -> Tuple[int, int, int]:
+        """Estime (latence, débit par lot, cadence des lots) pour une route.
+
+        La latence compte chaque liaison plus un tour par zone restreinte.
+        Le débit est borné par la capacité de chaque liaison et des zones
+        intermédiaires. En présence d'une zone restreinte, les lots successifs
+        sont estimés espacés de deux tours. Cette estimation sert à répartir
+        les drones; la simulation réelle reste l'autorité sur les mouvements.
+        """
+        if len(path) < 2:
+            raise ValueError("Un chemin doit contenir au moins deux hubs distincts.")
+
+        latency = len(path) - 1
+        capacities: List[int] = []
+        for origin, target in zip(path, path[1:]):
+            capacities.append(self.graph.get_link_capacity(origin, target))
+
+        has_restricted_zone = False
+        for zone_name in path[1:-1]:
+            zone = self.graph.get_zone(zone_name)
+            if zone is None:
+                raise ValueError(f"Zone inconnue dans le chemin : '{zone_name}'.")
+            capacities.append(zone.max_drones)
+            if zone.zone_type == "restricted":
+                has_restricted_zone = True
+                latency += 1
+
+        if not capacities or min(capacities) <= 0:
+            raise ValueError("Le chemin doit avoir une capacité positive.")
+
+        throughput = min(capacities)
+        cadence = 2 if has_restricted_zone else 1
+        return latency, throughput, cadence
 
     def _validate_path(self, path: List[str], path_number: int) -> List[str]:
         """Vérifie la structure du chemin avant de lancer la simulation."""
@@ -94,6 +153,13 @@ class Simulator:
             if self.graph.is_blocked(zone_name):
                 raise ValueError(
                     f"Le chemin {path_number} traverse la zone bloquée '{zone_name}'."
+                )
+
+        for zone_name in path[1:-1]:
+            zone = self.graph.get_zone(zone_name)
+            if zone is None or zone.max_drones <= 0:
+                raise ValueError(
+                    f"La zone intermédiaire '{zone_name}' doit avoir une capacité positive."
                 )
 
         for origin, target in zip(path, path[1:]):
