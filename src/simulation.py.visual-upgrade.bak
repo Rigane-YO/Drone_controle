@@ -1,26 +1,7 @@
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from graph import NetworkGraph
 from models import Drone
-
-
-@dataclass
-class _DroneSnapshot:
-    current_location: str
-    path: List[str]
-    status: str
-    turns_spent_in_zone: int
-
-
-@dataclass
-class _SimulatorSnapshot:
-    turn: int
-    drones: List[_DroneSnapshot]
-    zone_occupancy: Dict[str, int]
-    error: Optional[str]
-    deadlocked: bool
-    waited_this_turn: bool
 
 
 class Simulator:
@@ -59,9 +40,6 @@ class Simulator:
         self.error: Optional[str] = None
         self.deadlocked = False
         self._waited_this_turn = False
-        # Historique borné pour permettre un retour en arrière sans
-        # conserver une quantité de mémoire illimitée.
-        self._history: List[_SimulatorSnapshot] = []
 
         validated_paths = [
             self._validate_path(path, index)
@@ -210,9 +188,6 @@ class Simulator:
         if self.is_finished() or self.deadlocked:
             return []
 
-        self._history.append(self._capture_snapshot())
-        if len(self._history) > 1000:
-            del self._history[0]
         self.turn += 1
         moves = self._simulate_turn()
         if not moves and not self.is_finished() and not self._waited_this_turn:
@@ -223,44 +198,6 @@ class Simulator:
                     "aucun mouvement possible."
                 )
         return moves
-
-    def _capture_snapshot(self) -> _SimulatorSnapshot:
-        """Copie l'état mutable nécessaire pour annuler un tour."""
-        drone_states = [
-            _DroneSnapshot(
-                current_location=drone.current_location,
-                path=list(drone.path),
-                status=drone.status,
-                turns_spent_in_zone=drone.turns_spent_in_zone,
-            )
-            for drone in self.drones
-        ]
-        return _SimulatorSnapshot(
-            turn=self.turn,
-            drones=drone_states,
-            zone_occupancy=dict(self.zone_occupancy),
-            error=self.error,
-            deadlocked=self.deadlocked,
-            waited_this_turn=self._waited_this_turn,
-        )
-
-    def undo_step(self) -> bool:
-        """Restaure l'état précédant le dernier appel à step()."""
-        if not self._history:
-            return False
-
-        snapshot = self._history.pop()
-        self.turn = snapshot.turn
-        for drone, saved in zip(self.drones, snapshot.drones):
-            drone.current_location = saved.current_location
-            drone.path = list(saved.path)
-            drone.status = saved.status
-            drone.turns_spent_in_zone = saved.turns_spent_in_zone
-        self.zone_occupancy = dict(snapshot.zone_occupancy)
-        self.error = snapshot.error
-        self.deadlocked = snapshot.deadlocked
-        self._waited_this_turn = snapshot.waited_this_turn
-        return True
 
     def run(self) -> bool:
         """Exécute la simulation et retourne True uniquement en cas de succès."""

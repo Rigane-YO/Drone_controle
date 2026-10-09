@@ -1,7 +1,7 @@
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pyray as pr
 
@@ -113,18 +113,6 @@ class Visualizer3D:
         self.step_interval = 0.8         # Vitesse de simulation
         self.show_connections = True
 
-        # Affichage interactif et diagnostic de la scène.
-        self.show_zone_labels = False
-        self.show_capacity_gauges = False
-        self.show_trails = True
-        self.follow_drone_id: Optional[str] = None
-        self.hovered_zone: Optional[str] = None
-        self.drone_trails: Dict[str, List[List[float]]] = {}
-        self.render_frame_index = 0
-        self.last_moves: List[str] = []
-        self._speed_slider_dragging = False
-        self._camera_transition: Optional[Tuple[float, float, float, float, float]] = None
-
         # Contrôle de la caméra sphérique (Attributs d'instance)
         self.cam_distance = 35.0
         self.cam_yaw = 0.0
@@ -164,12 +152,6 @@ class Visualizer3D:
         self.cam_distance = max(35.0, self.radius_z * 2.2)
         self.cam_yaw = 0.0
         self.cam_pitch = 0.95
-        self._home_cam_distance = self.cam_distance
-        self.follow_drone_id = None
-        self._camera_transition = None
-        self.drone_trails.clear()
-        self.show_trails = self.num_nodes < 24
-        self.last_moves = []
 
         self.node_positions.clear()
         self.drone_positions.clear()
@@ -273,218 +255,15 @@ class Visualizer3D:
                 return False
         return True
 
-    def _load_planet_model(self, low_detail: bool = False) -> Any:
-        """Charge un modèle; les grandes cartes peuvent utiliser planet_low.glb."""
-        normal_path = os.path.join("assets", "planet.glb")
-        low_path = os.path.join("assets", "planet_low.glb")
-        path = low_path if low_detail and os.path.exists(low_path) else normal_path
+    def _load_planet_model(self):
+        """Charge assets/planet.glb (planète volcanique). Retourne None si absent."""
+        path = os.path.join("assets", "planet.glb")
         if os.path.exists(path):
             try:
                 return pr.load_model(path)
             except Exception as e:
-                print(f"⚠ Erreur modèle planète ({path}) : {e}")
+                print(f"⚠ Erreur modèle planète : {e}")
         return None
-
-    @staticmethod
-    def _edge_key(zone1: str, zone2: str) -> Tuple[str, str]:
-        return (zone1, zone2) if zone1 <= zone2 else (zone2, zone1)
-
-    def _pending_link_load(self, zone1: str, zone2: str) -> int:
-        """Compte les drones dont le prochain déplacement vise cette liaison."""
-        if self.simulator is None:
-            return 0
-        key = self._edge_key(zone1, zone2)
-        return sum(
-            1 for drone in self.simulator.drones
-            if drone.status != "delivered" and drone.path
-            and self._edge_key(drone.current_location, drone.path[0]) == key
-        )
-
-    @staticmethod
-    def _connection_color(load_ratio: float) -> List[int]:
-        """Couleur informative : cyan peu chargé, ambre chargé, rouge saturé."""
-        if load_ratio >= 1.0:
-            return [255, 70, 90, 230]
-        if load_ratio >= 0.66:
-            return [255, 185, 45, 220]
-        if load_ratio >= 0.33:
-            return [35, 205, 255, 210]
-        return [65, 105, 170, 190]
-
-    def _draw_hub_ring(
-        self, center: List[float], radius: float, color: List[int]
-    ) -> None:
-        """Dessine deux anneaux fins autour d'un hub, sans teinter la lave."""
-        for ring_radius, segments, height in (
-            (radius, 24, center[1] + radius * 0.04),
-            (radius * 1.18, 20, center[1] + radius * 0.06),
-        ):
-            previous = [
-                center[0] + ring_radius, height, center[2]
-            ]
-            for index in range(1, segments + 1):
-                angle = 2.0 * math.pi * index / segments
-                current = [
-                    center[0] + math.cos(angle) * ring_radius,
-                    height,
-                    center[2] + math.sin(angle) * ring_radius,
-                ]
-                pr.draw_line_3d(previous, current, color)
-                previous = current
-
-    def _set_camera_view(self, yaw: float, pitch: float) -> None:
-        """Anime un changement de vue clavier sur une courte transition."""
-        self._camera_transition = (
-            self.cam_yaw, self.cam_pitch, yaw, pitch, time.time()
-        )
-
-    def _reset_camera(self) -> None:
-        self.follow_drone_id = None
-        self._set_camera_view(0.0, 0.95)
-        self.cam_distance = getattr(self, "_home_cam_distance", 35.0)
-
-    def _cycle_follow_drone(self) -> None:
-        if self.simulator is None or not self.simulator.drones:
-            self.follow_drone_id = None
-            return
-        drone_ids = [drone.id for drone in self.simulator.drones]
-        if self.follow_drone_id not in drone_ids:
-            self.follow_drone_id = drone_ids[0]
-            return
-        current_follow = self.follow_drone_id
-        if current_follow is None:
-            self.follow_drone_id = drone_ids[0]
-            return
-        current_index = drone_ids.index(current_follow)
-        self.follow_drone_id = drone_ids[(current_index + 1) % len(drone_ids)]
-
-    def _advance_simulation(self) -> None:
-        """Avance d'un tour via l'API publique du moteur."""
-        if self.simulator is None or self.simulator.deadlocked:
-            self.simulation_running = False
-            return
-        self.last_moves = self.simulator.step()
-        if self.simulator.deadlocked:
-            self.simulation_running = False
-
-    def _undo_simulation(self) -> None:
-        """Annule le dernier tour et réaligne visuellement les drones."""
-        if self.simulator is None or not self.simulator.undo_step():
-            return
-        self.last_moves = []
-        self.simulation_running = False
-        self.drone_trails.clear()
-        for drone in self.simulator.drones:
-            node_pos = self.node_positions.get(drone.current_location)
-            if node_pos is not None:
-                self.drone_positions[drone.id] = [
-                    node_pos[0], node_pos[1] + self.planet_size * 0.5, node_pos[2]
-                ]
-
-    def _track_drone_trail(self, drone_id: str, position: List[float]) -> None:
-        trail = self.drone_trails.setdefault(drone_id, [])
-        if not trail or sum(
-            (position[axis] - trail[-1][axis]) ** 2 for axis in range(3)
-        ) >= 0.0064:
-            trail.append(list(position))
-        if len(trail) > 18:
-            del trail[:-18]
-
-    def _pick_hovered_zone(self, camera: Any) -> Optional[str]:
-        mouse = pr.get_mouse_position()
-        closest_name: Optional[str] = None
-        closest_distance = float("inf")
-        hit_radius = max(16.0, self.planet_size * 5.0)
-        for zone_name, position in self.node_positions.items():
-            screen = pr.get_world_to_screen(position, camera)
-            distance = math.hypot(mouse.x - screen.x, mouse.y - screen.y)
-            if distance <= hit_radius and distance < closest_distance:
-                closest_name = zone_name
-                closest_distance = distance
-        return closest_name
-
-    def _draw_zone_overlays(self, camera: Any) -> None:
-        """Dessine les noms et jauges après la scène 3D pour rester lisibles."""
-        if self.graph is None or self.simulator is None:
-            return
-        occupancy = {name: 0 for name in self.graph.zones}
-        delivered_at_goal = 0
-        for drone in self.simulator.drones:
-            if drone.status == "delivered":
-                delivered_at_goal += 1
-            else:
-                current = drone.current_location
-                occupancy[current] = occupancy.get(current, 0) + 1
-
-        for zone_name, position in self.node_positions.items():
-            hovered = zone_name == self.hovered_zone
-            if not (self.show_zone_labels or self.show_capacity_gauges or hovered):
-                continue
-            screen = pr.get_world_to_screen(position, camera)
-            x, y = int(screen.x), int(screen.y)
-            zone = self.graph.get_zone(zone_name)
-            if zone is None:
-                continue
-
-            if self.show_zone_labels or hovered:
-                label_width = pr.measure_text(zone_name, 15)
-                label_x = x - label_width // 2
-                label_y = y - 27
-                pr.draw_rectangle(
-                    label_x - 5, label_y - 3, label_width + 10, 21, [4, 12, 25, 210]
-                )
-                color = COLOR_YELLOW if hovered else COLOR_WHITE
-                pr.draw_text(zone_name, label_x, label_y, 15, color)
-
-            if self.show_capacity_gauges or hovered:
-                is_goal = zone_name == self.simulator.end_hub
-                is_start = zone_name == self.simulator.start_hub
-                if is_goal:
-                    amount = delivered_at_goal
-                    capacity = max(1, self.simulator.nb_drones)
-                    counter_text = f"Arrivés {amount}/{self.simulator.nb_drones}"
-                elif is_start:
-                    amount = occupancy.get(zone_name, 0)
-                    capacity = max(1, self.simulator.nb_drones)
-                    counter_text = f"Départ {amount}/{self.simulator.nb_drones}"
-                else:
-                    amount = occupancy.get(zone_name, 0)
-                    capacity = max(1, zone.max_drones)
-                    counter_text = f"{amount}/{zone.max_drones} drones"
-                text_width = pr.measure_text(counter_text, 12)
-                gauge_x = x - 32
-                gauge_y = y + 5
-                pr.draw_text(counter_text, x - text_width // 2, gauge_y, 12, COLOR_WHITE)
-                pr.draw_rectangle(
-                    gauge_x, gauge_y + 15, 64, 5, [45, 55, 70, 230]
-                )
-                fill_width = int(64 * min(1.0, amount / capacity))
-                if amount >= capacity and not is_goal and not is_start:
-                    gauge_color = [255, 75, 85, 255]
-                else:
-                    gauge_color = [40, 220, 150, 255]
-                if fill_width > 0:
-                    pr.draw_rectangle(
-                        gauge_x, gauge_y + 15, fill_width, 5, gauge_color
-                    )
-
-    def _draw_speed_slider(self, x: int, y: int, width: int) -> None:
-        """Contrôle glissant du délai entre deux tours (0.1 à 3 secondes)."""
-        minimum, maximum = 0.1, 3.0
-        mouse = pr.get_mouse_position()
-        mouse_over = x <= mouse.x <= x + width and y - 12 <= mouse.y <= y + 18
-        if pr.is_mouse_button_pressed(pr.MOUSE_BUTTON_LEFT) and mouse_over:
-            self._speed_slider_dragging = True
-        if not pr.is_mouse_button_down(pr.MOUSE_BUTTON_LEFT):
-            self._speed_slider_dragging = False
-        if self._speed_slider_dragging:
-            ratio = max(0.0, min(1.0, (mouse.x - x) / width))
-            self.step_interval = minimum + ratio * (maximum - minimum)
-        ratio = (self.step_interval - minimum) / (maximum - minimum)
-        pr.draw_rectangle(x, y, width, 5, [45, 60, 80, 255])
-        pr.draw_rectangle(x, y, int(width * ratio), 5, COLOR_CYAN)
-        pr.draw_circle(int(x + width * ratio), y + 2, 8, COLOR_WHITE)
-
 
     def _load_planet_texture(self):
         """Repli : ancienne planète 2D (billboard) si le GLB est introuvable."""
@@ -600,22 +379,19 @@ class Visualizer3D:
         pr.draw_text("OPTIONS DE VISUALISATION", 50, 40, 32, COLOR_CYAN)
 
         cap_status = "ACTIVÉ" if self.show_capacity_info else "DÉSACTIVÉ"
-        if self._draw_button((60, 130, 450, 45), f"INFOS CAPACITÉ : {cap_status}"):
+        if self._draw_button((60, 130, 450, 45), f"INFOS CAPACITÉ (--capacity-info) : {cap_status}"):
             self.show_capacity_info = not self.show_capacity_info
-            self.show_capacity_gauges = self.show_capacity_info
 
         conn_status = "ACTIVÉ" if self.show_connections else "DÉSACTIVÉ"
         if self._draw_button((60, 190, 450, 45), f"AFFICHER CONNEXIONS : {conn_status}"):
             self.show_connections = not self.show_connections
 
-        speed_label = f"VITESSE DE SIMULATION : {self.step_interval:.2f}s / tour"
+        speed_label = f"VITESSE PAS A PAS : {self.step_interval:.1f}s"
         pr.draw_text(speed_label, 60, 260, 20, COLOR_WHITE)
-        self._draw_speed_slider(60, 302, 320)
-        pr.draw_text("L : noms | K : jauges | T : traînées", 60, 340, 16, COLOR_GRAY)
-        pr.draw_text(
-            "F : suivre drone | R : caméra | RETOUR : annuler un tour",
-            60, 365, 16, COLOR_GRAY
-        )
+        if self._draw_button((60, 290, 100, 35), "- 0.2s"):
+            self.step_interval = max(0.1, self.step_interval - 0.2)
+        if self._draw_button((170, 290, 100, 35), "+ 0.2s"):
+            self.step_interval = min(3.0, self.step_interval + 0.2)
 
         if self._draw_button((50, self.height - 70, 180, 45), "◄ RETOUR"):
             self.app_state = STATE_MENU_MAIN
@@ -640,8 +416,7 @@ class Visualizer3D:
                 print(f"⚠ Erreur vidéo intro : {e}")
 
         # ASSETS 3D
-        use_low_detail = bool(self.graph and len(self.graph.zones) >= 24)
-        planet_model = self._load_planet_model(low_detail=use_low_detail)
+        planet_model = self._load_planet_model()
         planet_texture = None if planet_model else self._load_planet_texture()
 
         # Fond : abstract.glb (animé) en priorité, sinon abstract.jpg (image fixe)
@@ -690,25 +465,15 @@ class Visualizer3D:
 
             if self.app_state == STATE_SIMULATION:
                 if pr.is_key_pressed(pr.KEY_UP):
-                    self._set_camera_view(0.0, 1.55)
+                    self.cam_yaw, self.cam_pitch = 0.0, 1.55
                 elif pr.is_key_pressed(pr.KEY_DOWN):
-                    self._set_camera_view(0.0, 0.05)
+                    self.cam_yaw, self.cam_pitch = 0.0, 0.05
                 elif pr.is_key_pressed(pr.KEY_LEFT):
-                    self._set_camera_view(-math.pi / 2, 0.1)
+                    self.cam_yaw, self.cam_pitch = -math.pi / 2, 0.1
                 elif pr.is_key_pressed(pr.KEY_RIGHT):
-                    self._set_camera_view(math.pi / 2, 0.1)
+                    self.cam_yaw, self.cam_pitch = math.pi / 2, 0.1
 
-                if self._camera_transition is not None:
-                    start_yaw, start_pitch, end_yaw, end_pitch, started = self._camera_transition
-                    progress = min(1.0, max(0.0, (current_time - started) / 0.4))
-                    eased = progress * progress * (3.0 - 2.0 * progress)
-                    self.cam_yaw = start_yaw + (end_yaw - start_yaw) * eased
-                    self.cam_pitch = start_pitch + (end_pitch - start_pitch) * eased
-                    if progress >= 1.0:
-                        self._camera_transition = None
-
-                if pr.is_mouse_button_down(pr.MOUSE_BUTTON_RIGHT):
-                    self._camera_transition = None
+                if pr.is_mouse_button_down(pr.MOUSE_BUTTON_MIDDLE):
                     delta = pr.get_mouse_delta()
                     self.cam_yaw -= delta.x * 0.006
                     self.cam_pitch = max(-1.55, min(1.55, self.cam_pitch + delta.y * 0.006))
@@ -720,42 +485,21 @@ class Visualizer3D:
                 if pr.is_key_pressed(pr.KEY_SPACE):
                     self.simulation_running = not self.simulation_running
 
-                if pr.is_key_pressed(pr.KEY_R):
-                    self._reset_camera()
-                if pr.is_key_pressed(pr.KEY_F):
-                    self._cycle_follow_drone()
-                if pr.is_key_pressed(pr.KEY_L):
-                    self.show_zone_labels = not self.show_zone_labels
-                if pr.is_key_pressed(pr.KEY_K):
-                    self.show_capacity_gauges = not self.show_capacity_gauges
-                if pr.is_key_pressed(pr.KEY_T):
-                    self.show_trails = not self.show_trails
-                if pr.is_key_pressed(pr.KEY_BACKSPACE) and self.simulator:
-                    self._undo_simulation()
-                    self.last_step_time = current_time
-
-                if (
-                    pr.is_key_pressed(pr.KEY_N) or pr.is_key_pressed(pr.KEY_ENTER)
-                ) and not all_done and self.simulator:
-                    self._advance_simulation()
-                    self.last_step_time = current_time
+                if (pr.is_key_pressed(pr.KEY_N) or pr.is_key_pressed(pr.KEY_ENTER)) and not all_done and self.simulator:
+                    self.simulator.turn += 1
+                    self.simulator._simulate_turn()
 
                 if self.simulation_running and not all_done and self.simulator:
                     if current_time - self.last_step_time > self.step_interval:
-                        self._advance_simulation()
+                        self.simulator.turn += 1
+                        self.simulator._simulate_turn()
                         self.last_step_time = current_time
 
             # Mise à jour continue de la caméra 3D
-            focus = [0.0, 0.0, 0.0]
-            if self.follow_drone_id in self.drone_positions:
-                focused_position = self.drone_positions[self.follow_drone_id]
-                focus = list(focused_position)
             cam_x = self.cam_distance * math.cos(self.cam_pitch) * math.sin(self.cam_yaw)
             cam_y = self.cam_distance * math.sin(self.cam_pitch)
             cam_z = self.cam_distance * math.cos(self.cam_pitch) * math.cos(self.cam_yaw)
-            camera.target = focus
-            camera.position = [focus[0] + cam_x, focus[1] + cam_y, focus[2] + cam_z]
-            self.hovered_zone = self._pick_hovered_zone(camera)
+            camera.position = [cam_x, cam_y, cam_z]
 
             if drone_model and animations and anim_count[0] > 0:
                 anim_frame_counter = (anim_frame_counter + 6.0) % animations[0].keyframeCount
@@ -770,16 +514,10 @@ class Visualizer3D:
                         curr[0] += (target_pos[0] - curr[0]) * 0.12
                         curr[1] += ((target_pos[1] + self.planet_size * 0.5) - curr[1]) * 0.12
                         curr[2] += (target_pos[2] - curr[2]) * 0.12
-                        if self.show_trails:
-                            self._track_drone_trail(drone.id, curr)
 
             # Le fond animé est rendu dans sa RenderTexture AVANT begin_drawing()
             if bg_anim:
-                # Le fond est recalculé une image sur deux; la RenderTexture
-                # conserve l'image précédente entre deux mises à jour.
-                if self.render_frame_index % 2 == 0:
-                    bg_anim.render()
-                self.render_frame_index += 1
+                bg_anim.render()
 
             pr.begin_drawing()
             pr.clear_background(bg_color)
@@ -796,9 +534,6 @@ class Visualizer3D:
                     p1 = self.node_positions.get(conn.zone1)
                     p2 = self.node_positions.get(conn.zone2)
                     if p1 and p2:
-                        waiting = self._pending_link_load(conn.zone1, conn.zone2)
-                        capacity = max(1, conn.max_link_capacity)
-                        line_color = self._connection_color(waiting / capacity)
                         pr.draw_line_3d(p1, p2, line_color)
 
             if self.simulator:
@@ -824,20 +559,6 @@ class Visualizer3D:
                     else:
                         pr.draw_billboard(camera, planet_texture, pos, size, tint)
 
-                    if self.simulator and zone_name == self.simulator.start_hub:
-                        self._draw_hub_ring(pos, size * 0.78, [80, 190, 255, 255])
-                    elif self.simulator and zone_name == self.simulator.end_hub:
-                        self._draw_hub_ring(pos, size * 0.78, [255, 90, 115, 255])
-
-                if self.show_trails:
-                    for trail in self.drone_trails.values():
-                        for trail_index in range(1, len(trail)):
-                            alpha = max(35, min(180, 35 + trail_index * 9))
-                            pr.draw_line_3d(
-                                trail[trail_index - 1], trail[trail_index],
-                                [50, 190, 255, alpha]
-                            )
-
                 for drone in self.simulator.drones:
                     d_pos = self.drone_positions[drone.id]
                     if drone_model:
@@ -850,51 +571,13 @@ class Visualizer3D:
 
             pr.end_mode_3d()
 
-            self._draw_zone_overlays(camera)
-
             if self.simulator:
                 pr.draw_text(f"Carte : {os.path.basename(self.current_map_path)}", 20, 20, 18, COLOR_CYAN)
                 pr.draw_text(f"Tour : {self.simulator.turn}", 20, 45, 22, COLOR_WHITE)
-                delivered_count = sum(
-                    1 for drone in self.simulator.drones
-                    if drone.status == "delivered"
-                )
-                drone_count = len(self.simulator.drones)
-                throughput = delivered_count / max(1, self.simulator.turn)
-                stats_x = self.width - 270
-                pr.draw_text(
-                    f"Tours écoulés : {self.simulator.turn}",
-                    stats_x, 20, 16, COLOR_WHITE
-                )
-                pr.draw_text(
-                    f"Drones arrivés : {delivered_count}/{drone_count}",
-                    stats_x, 42, 16, COLOR_WHITE
-                )
-                pr.draw_text(
-                    f"Débit moyen : {throughput:.2f} drone/tour",
-                    stats_x, 64, 15, COLOR_CYAN
-                )
-                if self.follow_drone_id:
-                    pr.draw_text(
-                        f"Suivi : {self.follow_drone_id} (F suivant)",
-                        stats_x, 85, 14, COLOR_YELLOW
-                    )
-                pr.draw_text(
-                    "ESPACE : lecture/pause | N/ENTRÉE : tour | RETOUR : annuler | P : menu",
-                    20, 75, 14, COLOR_GRAY
-                )
-                pr.draw_text(
-                    "Clic droit : tourner | Molette : zoom | Flèches : vue | "
-                    "F : suivre drone | R : reset",
-                    20, 94, 13, COLOR_GRAY
-                )
-                pr.draw_text(
-                    "L : noms | K : jauges | T : traînées",
-                    20, 112, 13, COLOR_GRAY
-                )
+                pr.draw_text("ESPACE : Pause | N / ENTRÉE : Pas à Pas | P : Menu", 20, 75, 15, COLOR_GRAY)
 
                 if self.show_capacity_info and self.graph:
-                    y_cap = 140
+                    y_cap = 100
                     pr.draw_text("--- INFOS CAPACITÉ ---", 20, y_cap, 14, COLOR_YELLOW)
                     for z_name, zone in self.graph.zones.items():
                         y_cap += 18
@@ -904,19 +587,8 @@ class Visualizer3D:
                         drones_in_zone = sum(1 for d in self.simulator.drones if d.current_location == z_name)
                         pr.draw_text(f"Zone {z_name}: {drones_in_zone}/{zone.max_drones}", 20, y_cap, 13, COLOR_GOLD)
 
-                if self.simulator.deadlocked:
-                    message = self.simulator.error or "Aucun mouvement possible."
-                    pr.draw_text(
-                        "SIMULATION BLOQUÉE", 20, self.height - 50, 22, [255, 80, 80, 255]
-                    )
-                    pr.draw_text(
-                        message[:100], 20, self.height - 25, 14, [255, 135, 135, 255]
-                    )
-                elif all_done:
-                    pr.draw_text(
-                        "TOUS LES DRONES SONT ARRIVÉS !",
-                        20, self.height - 50, 22, [50, 220, 100, 255]
-                    )
+                if all_done:
+                    pr.draw_text("TOUS LES DRONES SONT ARRIVÉS !", 20, self.height - 50, 22, [50, 220, 100, 255])
 
             if self.app_state == STATE_MENU_MAIN:
                 if self._draw_main_menu() == "EXIT":
