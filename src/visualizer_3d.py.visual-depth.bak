@@ -26,7 +26,7 @@ COLOR_WHITE = [245, 245, 245, 255]
 
 # Rayon de la sphère dans Blender (RADIUS dans lava_planet_blender.py).
 # Sert à ajuster l'échelle du modèle : diamètre affiché = planet_size.
-PLANET_MODEL_RADIUS = 4
+PLANET_MODEL_RADIUS = 2.0
 
 # Fond animé (assets/abstract.glb) : caméra alignée sur l'aperçu du script Blender.
 # Conversion Blender (x, y, z) -> raylib (x, z, -y).
@@ -161,13 +161,7 @@ class Visualizer3D:
         self.drone_scale = max(0.04, min(0.14, 0.8 / math.sqrt(self.num_nodes)))
 
         # Réinitialisation de la caméra adaptative
-        # Keep the added upper/lower tiers inside the initial camera frame.
-        _height_step_for_view = max(3.2, self.planet_size * 1.7)
-        self.cam_distance = max(
-            35.0,
-            self.radius_z * 2.2,
-            _height_step_for_view * 5.0,
-        )
+        self.cam_distance = max(35.0, self.radius_z * 2.2)
         self.cam_yaw = 0.0
         self.cam_pitch = 0.95
         self._home_cam_distance = self.cam_distance
@@ -240,17 +234,6 @@ class Visualizer3D:
 
         num_rings = 4 if n >= 12 else (2 if n >= 6 else 1)
 
-        # VISUAL DEPTH UPGRADE: stable height layers based on map topology.
-        # Higher-degree zones tend to stay near the central level; others use
-        # repeatable positive/negative levels instead of tiny random-looking offsets.
-        _max_degree = max(
-            (len(self.graph.get_neighbors(name)) for name in internal_zones),
-            default=0,
-        )
-        _central_degree_threshold = max(3, _max_degree - 1)
-        _height_step = max(3.2, self.planet_size * 1.7)
-        _height_pattern = (0, -1, 1, -2, 2)
-
         for i, zone_name in enumerate(internal_zones):
             ring_idx = i % num_rings
             radius_x = (self.radius_x * 0.25) + ring_idx * (self.radius_x * 0.25)
@@ -263,15 +246,7 @@ class Visualizer3D:
 
             x = radius_x * math.cos(angle)
             z = radius_z * math.sin(angle)
-            # Keep highly connected zones around y=0. Other zones are spread
-            # above and below the ring in a deterministic, balanced pattern.
-            _degree = len(self.graph.get_neighbors(zone_name))
-            if _degree >= _central_degree_threshold:
-                _height_level = 0
-            else:
-                _pattern_index = (i + ring_idx) % len(_height_pattern)
-                _height_level = _height_pattern[_pattern_index]
-            y = _height_level * _height_step
+            y = math.sin(i * 1.5) * 1.0
 
             self.node_positions[zone_name] = [x, y, z]
 
@@ -824,18 +799,7 @@ class Visualizer3D:
                         waiting = self._pending_link_load(conn.zone1, conn.zone2)
                         capacity = max(1, conn.max_link_capacity)
                         line_color = self._connection_color(waiting / capacity)
-                        # VISUAL DEPTH UPGRADE: a dark pipe sleeve plus a
-                        # brighter load-colored core makes every edge readable.
-                        _pipe_radius = max(0.085, min(0.24, self.planet_size * 0.075))
-                        _pipe_core_radius = _pipe_radius * 0.66
-                        pr.draw_cylinder_ex(
-                            p1, p2, _pipe_radius, _pipe_radius, 8,
-                            [18, 31, 49, 255],
-                        )
-                        pr.draw_cylinder_ex(
-                            p1, p2, _pipe_core_radius, _pipe_core_radius, 8,
-                            line_color,
-                        )
+                        pr.draw_line_3d(p1, p2, line_color)
 
             if self.simulator:
                 for idx, (zone_name, pos) in enumerate(self.node_positions.items()):
