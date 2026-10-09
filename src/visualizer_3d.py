@@ -826,8 +826,8 @@ class Visualizer3D:
                         line_color = self._connection_color(waiting / capacity)
                         # VISUAL DEPTH UPGRADE: a dark pipe sleeve plus a
                         # brighter load-colored core makes every edge readable.
-                        _pipe_radius = max(0.085, min(0.24, self.planet_size * 0.075))
-                        _pipe_core_radius = _pipe_radius * 0.66
+                        _pipe_radius = max(0.042, min(0.10, self.planet_size * 0.075))
+                        _pipe_core_radius = _pipe_radius * 0.60
                         pr.draw_cylinder_ex(
                             p1, p2, _pipe_radius, _pipe_radius, 8,
                             [18, 31, 49, 255],
