@@ -471,13 +471,17 @@ class Visualizer3D:
         return [125, 165, 190, 255]
 
     def _draw_minimap(self) -> None:
-        """Dessine un radar 2D en bas à gauche, par-dessus la scène 3D."""
+        """Dessine un radar 2D basé sur les coordonnées x/y du fichier de carte.
+
+        La disposition en anneaux utilisée par la scène 3D n'est jamais utilisée
+        ici : le mini-map reproduit la géométrie définie dans le fichier .txt.
+        """
         if (
             not getattr(self, "show_minimap", True)
             or self.app_state != STATE_SIMULATION
             or self.graph is None
             or self.simulator is None
-            or not self.node_positions
+            or not self.graph.zones
         ):
             return
 
@@ -488,25 +492,37 @@ class Visualizer3D:
         panel_x = 16
         panel_y = screen_h - panel_h - 16
 
-        # Fond semi-transparent pour rester lisible sur le fond animé.
+        # Fond semi-transparent pour garder le radar lisible.
         pr.draw_rectangle(panel_x, panel_y, panel_w, panel_h, [3, 10, 19, 225])
         pr.draw_rectangle_lines(panel_x, panel_y, panel_w, panel_h, [0, 165, 210, 255])
-        pr.draw_text("RADAR  /  VUE 2D", panel_x + 11, panel_y + 7, 14, [70, 225, 255, 255])
+        pr.draw_text("RADAR  /  CARTE 2D", panel_x + 11, panel_y + 7, 14, [70, 225, 255, 255])
 
-        point_values = list(self.node_positions.values())
-        min_x = min(point[0] for point in point_values)
-        max_x = max(point[0] for point in point_values)
-        min_z = min(point[2] for point in point_values)
-        max_z = max(point[2] for point in point_values)
+        # IMPORTANT : utiliser Zone.x / Zone.y issus du fichier de carte,
+        # pas self.node_positions (qui contient la disposition 3D en anneaux).
+        map_points: Dict[str, Tuple[float, float]] = {
+            name: (float(zone.x), float(zone.y))
+            for name, zone in self.graph.zones.items()
+        }
+        xs = [point[0] for point in map_points.values()]
+        ys = [point[1] for point in map_points.values()]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
         range_x = max(max_x - min_x, 1.0)
-        range_z = max(max_z - min_z, 1.0)
+        range_y = max(max_y - min_y, 1.0)
 
         inner_x = panel_x + 11
         inner_y = panel_y + 29
         inner_w = panel_w - 22
         inner_h = panel_h - 53
 
-        # Grille légère, comme un radar de jeu.
+        # Une même échelle sur les deux axes conserve les proportions du plan.
+        scale = min(inner_w / range_x, inner_h / range_y)
+        map_draw_w = range_x * scale
+        map_draw_h = range_y * scale
+        offset_x = inner_x + (inner_w - map_draw_w) / 2.0
+        offset_y = inner_y + (inner_h - map_draw_h) / 2.0
+
+        # Grille discrète du radar.
         grid_color = [25, 52, 68, 180]
         for part in (1, 2, 3):
             gx = inner_x + int(inner_w * part / 4)
@@ -514,25 +530,25 @@ class Visualizer3D:
             pr.draw_line(gx, inner_y, gx, inner_y + inner_h, grid_color)
             pr.draw_line(inner_x, gy, inner_x + inner_w, gy, grid_color)
 
-        def project(world_pos: List[float]) -> Tuple[int, int]:
-            px = inner_x + int(((world_pos[0] - min_x) / range_x) * inner_w)
-            # Top-down view: world Z increases downward on the radar.
-            py = inner_y + int(((max_z - world_pos[2]) / range_z) * inner_h)
+        def project_map(x: float, y: float) -> Tuple[int, int]:
+            # On conserve l'orientation des coordonnées x/y du fichier.
+            px = int(round(offset_x + (x - min_x) * scale))
+            py = int(round(offset_y + (y - min_y) * scale))
             return px, py
 
-        # Les liaisons restent discrètes; les couleurs des zones suivent la carte.
+        # Connexions projetées entre les coordonnées originales des zones.
         for connection in self.graph.connections_list:
-            first = self.node_positions.get(connection.zone1)
-            second = self.node_positions.get(connection.zone2)
+            first = map_points.get(connection.zone1)
+            second = map_points.get(connection.zone2)
             if first is None or second is None:
                 continue
-            x1, y1 = project(first)
-            x2, y2 = project(second)
+            x1, y1 = project_map(first[0], first[1])
+            x2, y2 = project_map(second[0], second[1])
             pr.draw_line(x1, y1, x2, y2, [65, 88, 105, 255])
 
-        # Zones/hubs.
-        for zone_name, world_pos in self.node_positions.items():
-            px, py = project(world_pos)
+        # Zones/hubs à leur emplacement exact dans la carte source.
+        for zone_name, map_pos in map_points.items():
+            px, py = project_map(map_pos[0], map_pos[1])
             is_hub = zone_name in {
                 self.simulator.start_hub, self.simulator.end_hub
             }
@@ -540,8 +556,18 @@ class Visualizer3D:
             pr.draw_circle(px, py, radius + 2, [4, 9, 15, 255])
             pr.draw_circle(px, py, radius, self._minimap_zone_color(zone_name))
 
-        # Les positions 3D interpolées sont projetées sur X/Z : les marqueurs
-        # se déplacent en continu au lieu de sauter d'un nœud à l'autre.
+        # Les marqueurs suivent les coordonnées de la carte, avec interpolation
+        # 2D indépendante de l'animation 3D. Cela évite de projeter les anneaux.
+        signature = tuple(sorted(
+            (name, self.graph.zones[name].x, self.graph.zones[name].y)
+            for name in self.graph.zones
+        ))
+        if getattr(self, "_minimap_map_signature", None) != signature:
+            self._minimap_map_signature = signature
+            self._minimap_drone_positions: Dict[str, List[float]] = {}
+        elif not hasattr(self, "_minimap_drone_positions"):
+            self._minimap_drone_positions = {}
+
         drone_palette = [
             [40, 235, 255, 255], [255, 175, 65, 255],
             [225, 105, 255, 255], [130, 255, 135, 255],
@@ -549,10 +575,20 @@ class Visualizer3D:
             [115, 160, 255, 255], [255, 255, 255, 255],
         ]
         for index, drone in enumerate(self.simulator.drones):
-            world_pos = self.drone_positions.get(drone.id)
-            if world_pos is None:
+            zone_point = map_points.get(drone.current_location)
+            if zone_point is None:
                 continue
-            px, py = project(world_pos)
+            target_x, target_y = zone_point
+            current = self._minimap_drone_positions.get(drone.id)
+            if current is None:
+                current = [target_x, target_y]
+            else:
+                current = [
+                    current[0] + (target_x - current[0]) * 0.22,
+                    current[1] + (target_y - current[1]) * 0.22,
+                ]
+            self._minimap_drone_positions[drone.id] = current
+            px, py = project_map(current[0], current[1])
             color = drone_palette[index % len(drone_palette)]
             pr.draw_circle(px, py, 6, [235, 245, 255, 235])
             pr.draw_circle(px, py, 4, color)
