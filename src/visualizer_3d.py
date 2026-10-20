@@ -4,11 +4,13 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyray as pr
+from pyray import KeyboardKey, MouseButton, TextureFilter
 
 from graph import NetworkGraph
 from simulation import Simulator
 from intro_video import IntroVideo
 from parser import parse_map_file
+from planet_shader import ATMOSPHERES, PlanetShader
 
 
 # États de l'interface
@@ -24,9 +26,15 @@ COLOR_YELLOW = [255, 249, 0, 255]
 COLOR_GRAY = [255, 130, 130, 255]
 COLOR_WHITE = [245, 245, 245, 255]
 
-# Rayon de la sphère dans Blender (RADIUS dans lava_planet_blender.py).
-# Sert à ajuster l'échelle du modèle : diamètre affiché = planet_size.
+# Rayon réel des planètes générées par make_planet_glb.py.
+PLANET_MODEL_NATIVE_RADIUS = 2.0
+# Sert à ajuster l'échelle du modèle. Avec 2.0 le diamètre affiché vaut
+# planet_size ; avec 4 (valeur actuelle) les planètes sont deux fois plus
+# petites.
 PLANET_MODEL_RADIUS = 4
+
+# À partir de ce nombre de zones : planet_low.glb pour les zones non-hubs.
+LOW_DETAIL_ZONE_COUNT = 14
 
 # Fond animé (assets/abstract.glb) : caméra alignée sur l'aperçu du script Blender.
 # Conversion Blender (x, y, z) -> raylib (x, z, -y).
@@ -35,7 +43,9 @@ BG_CAMERA_TARGET = [0.0, 0.0, -1.0]
 BG_CAMERA_FOVY = 50.0
 BG_CLEAR_COLOR = [2, 2, 8, 255]
 BG_RENDER_SCALE = 1.0   # 1.5 ou 2.0 = bords plus lisses (rendu plus lourd)
-BG_ANIM_SPEED = 1.0     # images d'animation avancées à chaque image affichée
+# Le fond n'est rendu qu'une image sur deux : on avance de 2 images
+# d'animation à chaque rendu pour garder la vitesse d'origine.
+BG_ANIM_SPEED = 2.0
 
 
 class AnimatedBackground:
@@ -43,6 +53,7 @@ class AnimatedBackground:
     avec sa propre caméra, puis affiché en plein écran derrière la scène principale."""
 
     def __init__(self, path: str, width: int, height: int) -> None:
+        """Charge le GLB et crée la texture de rendu."""
         self.model = pr.load_model(path)
         self.anim_count = pr.ffi.new("int *")
         self.animations = pr.load_model_animations(path, self.anim_count)
@@ -50,12 +61,13 @@ class AnimatedBackground:
         self.target = pr.load_render_texture(
             int(width * BG_RENDER_SCALE), int(height * BG_RENDER_SCALE)
         )
-        pr.set_texture_filter(self.target.texture, pr.TEXTURE_FILTER_BILINEAR)
+        pr.set_texture_filter(self.target.texture, TextureFilter.TEXTURE_FILTER_BILINEAR)
         self.camera = pr.Camera3D(
             BG_CAMERA_POS, BG_CAMERA_TARGET, [0.0, 1.0, 0.0], BG_CAMERA_FOVY, 0
         )
 
     def _frame_count(self) -> int:
+        """Nombre d'images de la première animation (0 s'il n'y en a pas)."""
         if not self.animations or self.anim_count[0] <= 0:
             return 0
         anim = self.animations[0]
@@ -81,6 +93,7 @@ class AnimatedBackground:
         pr.end_texture_mode()
 
     def draw(self, darken: int = 110) -> None:
+        """Affiche la texture en plein écran, légèrement assombrie."""
         sw, sh = pr.get_screen_width(), pr.get_screen_height()
         tex = self.target.texture
         src = pr.Rectangle(0, 0, tex.width, -tex.height)   # RenderTexture inversée en Y
@@ -89,6 +102,7 @@ class AnimatedBackground:
         pr.draw_rectangle(0, 0, sw, sh, [0, 0, 0, darken])
 
     def unload(self) -> None:
+        """Libère le modèle, les animations et la texture."""
         if self.animations and self.anim_count[0] > 0:
             pr.unload_model_animations(self.animations, self.anim_count[0])
         pr.unload_model(self.model)
@@ -96,12 +110,15 @@ class AnimatedBackground:
 
 
 class Visualizer3D:
+    """Représentation graphique 3D de la simulation (raylib)."""
+
     def __init__(
         self,
         graph: Optional[NetworkGraph] = None,
         simulator: Optional[Simulator] = None,
         map_path: str = "maps/easy/linear.txt"
     ) -> None:
+        """Prépare le visualiseur ; la fenêtre s'ouvre dans run()."""
         self.width = 1200
         self.height = 800
 
@@ -116,6 +133,8 @@ class Visualizer3D:
         # "custom" = procedural rings/height levels; "map" = map x/y.
         self.layout_mode = "custom"
         self.show_minimap = True  # Radar 2D (touche M)
+        self._minimap_signature: Optional[Tuple[Tuple[str, int, int], ...]] = None
+        self._minimap_drone_positions: Dict[str, List[float]] = {}
 
         # Affichage interactif et diagnostic de la scène.
         self.show_zone_labels = False
@@ -133,6 +152,7 @@ class Visualizer3D:
         self.cam_distance = 35.0
         self.cam_yaw = 0.0
         self.cam_pitch = 0.95
+        self._home_cam_distance = 35.0
 
         # État initial
         self.app_state = STATE_SIMULATION if graph else STATE_MENU_MAIN
@@ -250,7 +270,7 @@ class Visualizer3D:
         if n == 0:
             return
 
-        num_rings = 4 if n >= 12 else (2 if n >= 6 else 1)
+        num_rings = 7 if n >= 12 else (2 if n >= 6 else 1)
 
         # VISUAL DEPTH UPGRADE: stable height layers based on map topology.
         # Higher-degree zones tend to stay near the central level; others use
@@ -348,31 +368,56 @@ class Visualizer3D:
         # Preserve the simulator's real drone locations while moving their
         # render positions to the new layout. Simulation state is untouched.
         self.drone_positions.clear()
+        fallback = self._drone_anchor(self.simulator.start_hub) or [0.0, 0.0, 0.0]
         for drone in self.simulator.drones:
-            node_pos = self.node_positions.get(
-                drone.current_location,
-                self.node_positions.get(self.simulator.start_hub, [0.0, 0.0, 0.0]),
+            self.drone_positions[drone.id] = list(
+                self._drone_anchor(drone.current_location) or fallback
             )
-            self.drone_positions[drone.id] = [
-                node_pos[0], node_pos[1] + self.planet_size * 0.5, node_pos[2]
+
+    def _planet_render_radius(self, is_hub: bool) -> float:
+        """Rayon réellement affiché d'une planète (dépend de PLANET_MODEL_RADIUS)."""
+        size = self.planet_size * (1.4 if is_hub else 1.0)
+        return size * PLANET_MODEL_NATIVE_RADIUS / (2.0 * PLANET_MODEL_RADIUS)
+
+    def _drone_anchor(self, location: str) -> Optional[List[float]]:
+        """Position d'un drone : sur la zone, ou au milieu du lien « a-b ».
+
+        Un drone en vol vers une zone restreinte a pour emplacement le nom de
+        la connexion (« zoneA-zoneB ») : il est dessiné au milieu du lien.
+        """
+        if self.simulator is None:
+            return None
+        position = self.node_positions.get(location)
+        if position is not None:
+            is_hub = location in (self.simulator.start_hub, self.simulator.end_hub)
+            lift = self._planet_render_radius(is_hub) + self.planet_size * 0.05
+            return [position[0], position[1] + lift, position[2]]
+        first, _, second = location.partition("-")
+        start = self.node_positions.get(first)
+        end = self.node_positions.get(second)
+        if start is not None and end is not None:
+            return [
+                (start[0] + end[0]) / 2,
+                (start[1] + end[1]) / 2 + self.planet_size * 0.4,
+                (start[2] + end[2]) / 2,
             ]
+        return None
 
     def _init_drones(self) -> None:
+        """Place tous les drones sur la zone de départ."""
         if not self.simulator:
             return
-        start_pos = self.node_positions.get(self.simulator.start_hub, [0.0, 0.0, 0.0])
+        start = self._drone_anchor(self.simulator.start_hub) or [0.0, 0.0, 0.0]
         for drone in self.simulator.drones:
-            self.drone_positions[drone.id] = [
-                start_pos[0],
-                start_pos[1] + (self.planet_size * 0.5),
-                start_pos[2]
-            ]
+            self.drone_positions[drone.id] = list(start)
 
     def _restart_simulation(self) -> None:
+        """Recharge la carte courante."""
         if self.current_map_path:
             self._load_map(self.current_map_path)
 
     def _all_drones_delivered(self) -> bool:
+        """True quand chaque drone est sur la zone d'arrivée."""
         if not self.simulator:
             return True
         for drone in self.simulator.drones:
@@ -380,9 +425,43 @@ class Visualizer3D:
                 return False
         return True
 
+    def _planet_atmosphere_for_zone(
+        self, zone_name: str, index: int
+    ) -> Tuple[float, float, float]:
+        """Use explicit map color for the rim, otherwise cycle subtle palettes."""
+        zone = self.graph.get_zone(zone_name) if self.graph is not None else None
+        if zone is not None and zone.color:
+            raw = zone.color.strip().lower()
+            named = {
+                "red": (1.00, 0.20, 0.22),
+                "green": (0.24, 0.92, 0.50),
+                "blue": (0.25, 0.52, 1.00),
+                "cyan": (0.12, 0.85, 1.00),
+                "yellow": (1.00, 0.78, 0.18),
+                "orange": (1.00, 0.40, 0.12),
+                "purple": (0.62, 0.30, 1.00),
+                "magenta": (1.00, 0.20, 0.72),
+                "pink": (1.00, 0.42, 0.68),
+                "white": (0.82, 0.90, 1.00),
+                "black": (0.28, 0.38, 0.52),
+                "gray": (0.48, 0.60, 0.72),
+                "grey": (0.48, 0.60, 0.72),
+            }
+            if raw in named:
+                return named[raw]
+            if raw.startswith("#") and len(raw) == 7:
+                try:
+                    return tuple(
+                        int(raw[offset:offset + 2], 16) / 255.0
+                        for offset in (1, 3, 5)
+                    )  # type: ignore[return-value]
+                except ValueError:
+                    pass
+        return ATMOSPHERES[index % len(ATMOSPHERES)]
+
     def _load_planet_model(self, low_detail: bool = False) -> Any:
         """Charge un modèle; les grandes cartes peuvent utiliser planet_low.glb."""
-        normal_path = os.path.join("assets", "planet.glb")
+        normal_path = os.path.join("assets", "planet_3.glb")
         low_path = os.path.join("assets", "planet_low.glb")
         path = low_path if low_detail and os.path.exists(low_path) else normal_path
         if os.path.exists(path):
@@ -394,6 +473,7 @@ class Visualizer3D:
 
     @staticmethod
     def _edge_key(zone1: str, zone2: str) -> Tuple[str, str]:
+        """Clé d'une liaison, indépendante du sens."""
         return (zone1, zone2) if zone1 <= zone2 else (zone2, zone1)
 
     def _pending_link_load(self, zone1: str, zone2: str) -> int:
@@ -441,16 +521,20 @@ class Visualizer3D:
 
     def _set_camera_view(self, yaw: float, pitch: float) -> None:
         """Anime un changement de vue clavier sur une courte transition."""
+        # Chemin le plus court : pas de tour complet inutile.
+        shortest = (yaw - self.cam_yaw + math.pi) % (2.0 * math.pi) - math.pi
         self._camera_transition = (
-            self.cam_yaw, self.cam_pitch, yaw, pitch, time.time()
+            self.cam_yaw, self.cam_pitch, self.cam_yaw + shortest, pitch, time.time()
         )
 
     def _reset_camera(self) -> None:
+        """Retour à la vue par défaut (distance d'origine, plus de suivi)."""
         self.follow_drone_id = None
         self._set_camera_view(0.0, 0.95)
-        self.cam_distance = getattr(self, "_home_cam_distance", 35.0)
+        self.cam_distance = self._home_cam_distance
 
     def _cycle_follow_drone(self) -> None:
+        """Passe au drone suivant pour la caméra de suivi."""
         if self.simulator is None or not self.simulator.drones:
             self.follow_drone_id = None
             return
@@ -482,13 +566,12 @@ class Visualizer3D:
         self.simulation_running = False
         self.drone_trails.clear()
         for drone in self.simulator.drones:
-            node_pos = self.node_positions.get(drone.current_location)
-            if node_pos is not None:
-                self.drone_positions[drone.id] = [
-                    node_pos[0], node_pos[1] + self.planet_size * 0.5, node_pos[2]
-                ]
+            anchor = self._drone_anchor(drone.current_location)
+            if anchor is not None:
+                self.drone_positions[drone.id] = anchor
 
     def _track_drone_trail(self, drone_id: str, position: List[float]) -> None:
+        """Ajoute la position à la traînée du drone (18 points au plus)."""
         trail = self.drone_trails.setdefault(drone_id, [])
         if not trail or sum(
             (position[axis] - trail[-1][axis]) ** 2 for axis in range(3)
@@ -498,6 +581,7 @@ class Visualizer3D:
             del trail[:-18]
 
     def _pick_hovered_zone(self, camera: Any) -> Optional[str]:
+        """Zone la plus proche du curseur (dans un rayon en pixels), ou None."""
         mouse = pr.get_mouse_position()
         closest_name: Optional[str] = None
         closest_distance = float("inf")
@@ -558,7 +642,7 @@ class Visualizer3D:
         ici : le mini-map reproduit la géométrie définie dans le fichier .txt.
         """
         if (
-            not getattr(self, "show_minimap", True)
+            not self.show_minimap
             or self.app_state != STATE_SIMULATION
             or self.graph is None
             or self.simulator is None
@@ -643,10 +727,8 @@ class Visualizer3D:
             (name, self.graph.zones[name].x, self.graph.zones[name].y)
             for name in self.graph.zones
         ))
-        if getattr(self, "_minimap_map_signature", None) != signature:
-            self._minimap_map_signature = signature
-            self._minimap_drone_positions: Dict[str, List[float]] = {}
-        elif not hasattr(self, "_minimap_drone_positions"):
+        if self._minimap_signature != signature:
+            self._minimap_signature = signature
             self._minimap_drone_positions = {}
 
         drone_palette = [
@@ -657,6 +739,14 @@ class Visualizer3D:
         ]
         for index, drone in enumerate(self.simulator.drones):
             zone_point = map_points.get(drone.current_location)
+            if zone_point is None and "-" in drone.current_location:
+                # Drone en vol : milieu de la connexion « a-b ».
+                first_name, _, second_name = drone.current_location.partition("-")
+                if first_name in map_points and second_name in map_points:
+                    zone_point = (
+                        (map_points[first_name][0] + map_points[second_name][0]) / 2,
+                        (map_points[first_name][1] + map_points[second_name][1]) / 2,
+                    )
             if zone_point is None:
                 continue
             target_x, target_y = zone_point
@@ -748,9 +838,9 @@ class Visualizer3D:
         minimum, maximum = 0.1, 3.0
         mouse = pr.get_mouse_position()
         mouse_over = x <= mouse.x <= x + width and y - 12 <= mouse.y <= y + 18
-        if pr.is_mouse_button_pressed(pr.MOUSE_BUTTON_LEFT) and mouse_over:
+        if pr.is_mouse_button_pressed(MouseButton.MOUSE_BUTTON_LEFT) and mouse_over:
             self._speed_slider_dragging = True
-        if not pr.is_mouse_button_down(pr.MOUSE_BUTTON_LEFT):
+        if not pr.is_mouse_button_down(MouseButton.MOUSE_BUTTON_LEFT):
             self._speed_slider_dragging = False
         if self._speed_slider_dragging:
             ratio = max(0.0, min(1.0, (mouse.x - x) / width))
@@ -760,13 +850,12 @@ class Visualizer3D:
         pr.draw_rectangle(x, y, int(width * ratio), 5, COLOR_CYAN)
         pr.draw_circle(int(x + width * ratio), y + 2, 8, COLOR_WHITE)
 
-
-    def _load_planet_texture(self):
+    def _load_planet_texture(self) -> Any:
         """Repli : ancienne planète 2D (billboard) si le GLB est introuvable."""
         path = os.path.join("assets", "planet.png")
         if os.path.exists(path):
             texture = pr.load_texture(path)
-            pr.set_texture_filter(texture, pr.TEXTURE_FILTER_BILINEAR)
+            pr.set_texture_filter(texture, TextureFilter.TEXTURE_FILTER_BILINEAR)
             return texture
 
         img = pr.gen_image_color(100, 100, pr.BLANK)
@@ -775,7 +864,8 @@ class Visualizer3D:
         pr.unload_image(img)
         return texture
 
-    def _draw_background(self, texture, darken: int = 110) -> None:
+    def _draw_background(self, texture: Any, darken: int = 110) -> None:
+        """Fond statique abstract.jpg, recadré pour remplir l'écran."""
         sw, sh = pr.get_screen_width(), pr.get_screen_height()
         tw, th = texture.width, texture.height
         scale = max(sw / tw, sh / th)
@@ -788,6 +878,7 @@ class Visualizer3D:
         pr.draw_rectangle(0, 0, sw, sh, [0, 0, 0, darken])
 
     def _draw_button(self, rect: Tuple[float, float, float, float], text: str) -> bool:
+        """Dessine un bouton ; True à la frame où on clique dessus."""
         mouse_pos = pr.get_mouse_position()
         r = pr.Rectangle(rect[0], rect[1], rect[2], rect[3])
         is_hovered = pr.check_collision_point_rec(mouse_pos, r)
@@ -805,9 +896,10 @@ class Visualizer3D:
         text_color = COLOR_WHITE if is_hovered else COLOR_GRAY
         pr.draw_text(text, text_x, text_y, 20, text_color)
 
-        return is_hovered and pr.is_mouse_button_pressed(pr.MOUSE_BUTTON_LEFT)
+        return is_hovered and pr.is_mouse_button_pressed(MouseButton.MOUSE_BUTTON_LEFT)
 
     def _draw_main_menu(self) -> Optional[str]:
+        """Menu principal / pause ; renvoie "EXIT" pour quitter."""
         pr.draw_rectangle(0, 0, self.width, self.height, [5, 10, 20, 210])
 
         title = "FLY-IN : MENU PRINCIPAL"
@@ -836,16 +928,17 @@ class Visualizer3D:
         return None
 
     def _draw_maps_menu(self) -> None:
+        """Choix de la carte, un onglet par difficulté."""
         pr.draw_rectangle(0, 0, self.width, self.height, [5, 10, 20, 230])
         pr.draw_text("SELECTION DE LA CARTE", 50, 40, 32, COLOR_CYAN)
 
         categories = ["easy", "medium", "hard", "challenger", "other"]
         tab_x = 50
         for cat in categories:
-            rect = (tab_x, 90, 110, 35)
+            rect = (tab_x, 90, 130, 35)   # 130 px : « CHALLENGER » débordait de 110
             if self._draw_button(rect, cat.upper()):
                 self.current_category = cat
-            tab_x += 120
+            tab_x += 140
 
         maps_list = self.categorized_maps.get(self.current_category, [])
         y_pos = 150
@@ -871,6 +964,7 @@ class Visualizer3D:
             self.app_state = STATE_MENU_MAIN
 
     def _draw_options_menu(self) -> None:
+        """Options d'affichage, disposition et vitesse de simulation."""
         pr.draw_rectangle(0, 0, self.width, self.height, [5, 10, 20, 230])
         pr.draw_text("OPTIONS DE VISUALISATION", 50, 40, 32, COLOR_CYAN)
 
@@ -910,6 +1004,7 @@ class Visualizer3D:
             self.app_state = STATE_MENU_MAIN
 
     def run(self) -> None:
+        """Ouvre la fenêtre et boucle jusqu'à la fermeture."""
         pr.init_window(self.width, self.height, "Fly-in : Visualisation 3D")
         pr.set_target_fps(60)
 
@@ -929,8 +1024,28 @@ class Visualizer3D:
                 print(f"⚠ Erreur vidéo intro : {e}")
 
         # ASSETS 3D
-        use_low_detail = bool(self.graph and len(self.graph.zones) >= 14)
-        planet_model = self._load_planet_model(low_detail=use_low_detail)
+        # Le modèle détaillé et le modèle léger sont chargés une fois ; le
+        # choix se fait à chaque image selon la carte courante (changer de
+        # carte depuis le menu garde ainsi le bon modèle).
+        planet_model = self._load_planet_model()
+        planet_model_low = None
+        if os.path.exists(os.path.join("assets", "planet_low.glb")):
+            planet_model_low = self._load_planet_model(low_detail=True)
+        if planet_model is None:
+            planet_model, planet_model_low = planet_model_low, None
+        planet_shader = PlanetShader.create() if planet_model else None
+        if planet_shader is not None:
+            try:
+                for loaded_model in (planet_model, planet_model_low):
+                    if loaded_model is not None:
+                        planet_shader.apply(loaded_model)
+            except Exception as error:
+                print(f"⚠ Shader de planète désactivé, rendu standard conservé : {error}")
+                try:
+                    planet_shader.unload()
+                except Exception:
+                    pass
+                planet_shader = None
         planet_texture = None if planet_model else self._load_planet_texture()
 
         # Fond : abstract.glb (animé) en priorité, sinon abstract.jpg (image fixe)
@@ -947,7 +1062,7 @@ class Visualizer3D:
         bg_path = os.path.join("assets", "abstract.jpg")
         if bg_anim is None and os.path.exists(bg_path):
             bg_texture = pr.load_texture(bg_path)
-            pr.set_texture_filter(bg_texture, pr.TEXTURE_FILTER_BILINEAR)
+            pr.set_texture_filter(bg_texture, TextureFilter.TEXTURE_FILTER_BILINEAR)
 
         model_path = os.path.join("assets", "drone.glb")
         drone_model, animations = None, None
@@ -962,7 +1077,6 @@ class Visualizer3D:
                 print(f"Erreur modèle 3D : {e}")
 
         bg_color = [2, 2, 8, 255]
-        line_color = [0, 120, 160, 180]
 
         camera = pr.Camera3D([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 55.0, 0)
 
@@ -971,20 +1085,20 @@ class Visualizer3D:
             all_done = self._all_drones_delivered()
 
             # TOUCHE P : Ouvrir / Fermer le menu Pause
-            if pr.is_key_pressed(pr.KEY_P):
+            if pr.is_key_pressed(KeyboardKey.KEY_P):
                 if self.app_state == STATE_SIMULATION:
                     self.app_state = STATE_MENU_MAIN
                 else:
                     self.app_state = STATE_SIMULATION
 
             if self.app_state == STATE_SIMULATION:
-                if pr.is_key_pressed(pr.KEY_UP):
+                if pr.is_key_pressed(KeyboardKey.KEY_UP):
                     self._set_camera_view(0.0, 1.55)
-                elif pr.is_key_pressed(pr.KEY_DOWN):
+                elif pr.is_key_pressed(KeyboardKey.KEY_DOWN):
                     self._set_camera_view(0.0, 0.05)
-                elif pr.is_key_pressed(pr.KEY_LEFT):
+                elif pr.is_key_pressed(KeyboardKey.KEY_LEFT):
                     self._set_camera_view(-math.pi / 2, 0.1)
-                elif pr.is_key_pressed(pr.KEY_RIGHT):
+                elif pr.is_key_pressed(KeyboardKey.KEY_RIGHT):
                     self._set_camera_view(math.pi / 2, 0.1)
 
                 if self._camera_transition is not None:
@@ -996,7 +1110,7 @@ class Visualizer3D:
                     if progress >= 1.0:
                         self._camera_transition = None
 
-                if pr.is_mouse_button_down(pr.MOUSE_BUTTON_RIGHT):
+                if pr.is_mouse_button_down(MouseButton.MOUSE_BUTTON_RIGHT):
                     self._camera_transition = None
                     delta = pr.get_mouse_delta()
                     self.cam_yaw -= delta.x * 0.006
@@ -1006,30 +1120,30 @@ class Visualizer3D:
                 if wheel != 0:
                     self.cam_distance = max(8.0, min(120.0, self.cam_distance - wheel * 2.5))
 
-                if pr.is_key_pressed(pr.KEY_SPACE):
+                if pr.is_key_pressed(KeyboardKey.KEY_SPACE):
                     self.simulation_running = not self.simulation_running
 
-                if pr.is_key_pressed(pr.KEY_R):
+                if pr.is_key_pressed(KeyboardKey.KEY_R):
                     self._reset_camera()
-                if pr.is_key_pressed(pr.KEY_F):
+                if pr.is_key_pressed(KeyboardKey.KEY_F):
                     self._cycle_follow_drone()
-                if pr.is_key_pressed(pr.KEY_L):
+                if pr.is_key_pressed(KeyboardKey.KEY_L):
                     self.show_zone_labels = not self.show_zone_labels
-                if pr.is_key_pressed(pr.KEY_K):
+                if pr.is_key_pressed(KeyboardKey.KEY_K):
                     self.show_capacity_gauges = not self.show_capacity_gauges
-                if pr.is_key_pressed(pr.KEY_T):
+                if pr.is_key_pressed(KeyboardKey.KEY_T):
                     self.show_trails = not self.show_trails
-                if pr.is_key_pressed(pr.KEY_M):
+                if pr.is_key_pressed(KeyboardKey.KEY_M):
                     self.show_minimap = not self.show_minimap
-                if pr.is_key_pressed(pr.KEY_V):
+                if pr.is_key_pressed(KeyboardKey.KEY_V):
                     self._toggle_layout_mode()
 
-                if pr.is_key_pressed(pr.KEY_BACKSPACE) and self.simulator:
+                if pr.is_key_pressed(KeyboardKey.KEY_BACKSPACE) and self.simulator:
                     self._undo_simulation()
                     self.last_step_time = current_time
 
                 if (
-                    pr.is_key_pressed(pr.KEY_N) or pr.is_key_pressed(pr.KEY_ENTER)
+                    pr.is_key_pressed(KeyboardKey.KEY_N) or pr.is_key_pressed(KeyboardKey.KEY_ENTER)
                 ) and not all_done and self.simulator:
                     self._advance_simulation()
                     self.last_step_time = current_time
@@ -1041,15 +1155,22 @@ class Visualizer3D:
 
             # Mise à jour continue de la caméra 3D
             focus = [0.0, 0.0, 0.0]
-            if self.follow_drone_id in self.drone_positions:
-                focused_position = self.drone_positions[self.follow_drone_id]
-                focus = list(focused_position)
+            followed = self.follow_drone_id
+            if followed is not None and followed in self.drone_positions:
+                focus = list(self.drone_positions[followed])
             cam_x = self.cam_distance * math.cos(self.cam_pitch) * math.sin(self.cam_yaw)
             cam_y = self.cam_distance * math.sin(self.cam_pitch)
             cam_z = self.cam_distance * math.cos(self.cam_pitch) * math.cos(self.cam_yaw)
-            camera.target = focus
-            camera.position = [focus[0] + cam_x, focus[1] + cam_y, focus[2] + cam_z]
-            self.hovered_zone = self._pick_hovered_zone(camera)
+            eye = [focus[0] + cam_x, focus[1] + cam_y, focus[2] + cam_z]
+            camera.target = pr.Vector3(*focus)
+            camera.position = pr.Vector3(*eye)
+            if planet_shader is not None:
+                planet_shader.update(eye, focus)
+            # Pas de survol de zone pendant les menus.
+            if self.app_state == STATE_SIMULATION:
+                self.hovered_zone = self._pick_hovered_zone(camera)
+            else:
+                self.hovered_zone = None
 
             if drone_model and animations and anim_count[0] > 0:
                 anim_frame_counter = (anim_frame_counter + 6.0) % animations[0].keyframeCount
@@ -1057,13 +1178,13 @@ class Visualizer3D:
 
             if self.simulator:
                 for drone in self.simulator.drones:
-                    target_zone_name = drone.current_location
-                    if target_zone_name in self.node_positions:
-                        target_pos = self.node_positions[target_zone_name]
+                    # Zone, ou milieu de la connexion si le drone est en vol.
+                    anchor = self._drone_anchor(drone.current_location)
+                    if anchor is not None:
                         curr = self.drone_positions[drone.id]
-                        curr[0] += (target_pos[0] - curr[0]) * 0.12
-                        curr[1] += ((target_pos[1] + self.planet_size * 0.5) - curr[1]) * 0.12
-                        curr[2] += (target_pos[2] - curr[2]) * 0.12
+                        curr[0] += (anchor[0] - curr[0]) * 0.12
+                        curr[1] += (anchor[1] - curr[1]) * 0.12
+                        curr[2] += (anchor[2] - curr[2]) * 0.12
                         if self.show_trails:
                             self._track_drone_trail(drone.id, curr)
 
@@ -1093,41 +1214,52 @@ class Visualizer3D:
                         waiting = self._pending_link_load(conn.zone1, conn.zone2)
                         capacity = max(1, conn.max_link_capacity)
                         line_color = self._connection_color(waiting / capacity)
-                        # VISUAL DEPTH UPGRADE: a dark pipe sleeve plus a
-                        # brighter load-colored core makes every edge readable.
+                        # Un seul cylindre par lien, coloré selon la charge.
                         _pipe_radius = max(0.042, min(0.10, self.planet_size * 0.075))
-                        _pipe_core_radius = _pipe_radius * 0.60
                         pr.draw_cylinder_ex(
                             p1, p2, _pipe_radius, _pipe_radius, 8,
                             line_color,
                         )
-                        pr.draw_cylinder_ex(
-                            p1, p2, _pipe_core_radius, _pipe_core_radius, 8,
-                            line_color,
-                        )
 
             if self.simulator:
+                low_detail_map = (
+                    self.graph is not None
+                    and len(self.graph.zones) >= LOW_DETAIL_ZONE_COUNT
+                )
                 for idx, (zone_name, pos) in enumerate(self.node_positions.items()):
                     size = self.planet_size
-                    tint = pr.WHITE
+                    tint: Any = pr.WHITE
+                    is_hub = False
 
                     if zone_name == self.simulator.start_hub:
                         size *= 1.4
                         tint = [100, 180, 255, 255]
+                        is_hub = True
                     elif zone_name == self.simulator.end_hub:
                         size *= 1.4
                         tint = [255, 90, 90, 255]
+                        is_hub = True
 
-                    if planet_model:
+                    model = planet_model
+                    if planet_model_low is not None and low_detail_map and not is_hub:
+                        model = planet_model_low
+
+                    if model:
                         # Planète 3D : diamètre = size, rotation lente décalée par zone
                         scale = size / (2.0 * PLANET_MODEL_RADIUS)
                         spin = (current_time * 12.0 + idx * 53.0) % 360.0
+                        if planet_shader is not None:
+                            planet_shader.set_atmosphere(
+                                self._planet_atmosphere_for_zone(zone_name, idx)
+                            )
                         pr.draw_model_ex(
-                            planet_model, pos, [0.0, 1.0, 0.0], spin,
+                            model, pos, [0.0, 1.0, 0.0], spin,
                             [scale, scale, scale], tint
                         )
-                    else:
+                    elif planet_texture is not None:
                         pr.draw_billboard(camera, planet_texture, pos, size, tint)
+                    else:
+                        pr.draw_sphere(pos, size / 2.0, tint)
 
                     if self.simulator and zone_name == self.simulator.start_hub:
                         self._draw_hub_ring(pos, size * 0.78, [80, 190, 255, 255])
@@ -1196,41 +1328,45 @@ class Visualizer3D:
                     )
                 pr.draw_text(
                     "ESPACE : lecture/pause | N/ENTRÉE : tour | RETOUR : annuler | P : menu",
-                    20, 75, 14, COLOR_GRAY
+                    20, 90, 14, COLOR_GRAY
                 )
                 pr.draw_text(
                     "Clic droit : tourner | Molette : zoom | Flèches : vue | "
                     "F : suivre drone | R : reset",
-                    20, 94, 13, COLOR_GRAY
+                    20, 108, 13, COLOR_GRAY
                 )
                 pr.draw_text(
-                    "L : noms | K : jauges | T : traînées",
-                    20, 112, 13, COLOR_GRAY
+                    "L : noms | K : jauges | T : traînées | M : mini-map | V : disposition",
+                    20, 125, 13, COLOR_GRAY
                 )
 
                 if self.show_capacity_info and self.graph:
-                    y_cap = 140
+                    y_cap = 155
+                    # La liste ne doit pas descendre sous le radar.
+                    capacity_limit = self.height - (240 if self.show_minimap else 80)
                     pr.draw_text("--- INFOS CAPACITÉ ---", 20, y_cap, 14, COLOR_YELLOW)
                     for z_name, zone in self.graph.zones.items():
                         y_cap += 18
-                        if y_cap > self.height - 80:
+                        if y_cap > capacity_limit:
                             pr.draw_text("...", 20, y_cap, 14, COLOR_YELLOW)
                             break
                         drones_in_zone = sum(1 for d in self.simulator.drones if d.current_location == z_name)
                         pr.draw_text(f"Zone {z_name}: {drones_in_zone}/{zone.max_drones}", 20, y_cap, 13, COLOR_GOLD)
 
+                # Le radar occupe le coin bas-gauche : messages décalés.
+                message_x = 330 if self.show_minimap else 20
                 if self.simulator.deadlocked:
                     message = self.simulator.error or "Aucun mouvement possible."
                     pr.draw_text(
-                        "SIMULATION BLOQUÉE", 20, self.height - 50, 22, [255, 80, 80, 255]
+                        "SIMULATION BLOQUÉE", message_x, self.height - 50, 22, [255, 80, 80, 255]
                     )
                     pr.draw_text(
-                        message[:100], 20, self.height - 25, 14, [255, 135, 135, 255]
+                        message[:100], message_x, self.height - 25, 14, [255, 135, 135, 255]
                     )
                 elif all_done:
                     pr.draw_text(
                         "TOUS LES DRONES SONT ARRIVÉS !",
-                        20, self.height - 50, 22, [50, 220, 100, 255]
+                        message_x, self.height - 50, 22, [50, 220, 100, 255]
                     )
 
             if self.app_state == STATE_MENU_MAIN:
@@ -1247,8 +1383,12 @@ class Visualizer3D:
             pr.unload_model_animations(animations, anim_count[0])
         if drone_model:
             pr.unload_model(drone_model)
+        if planet_shader is not None:
+            planet_shader.unload()
         if planet_model:
             pr.unload_model(planet_model)
+        if planet_model_low:
+            pr.unload_model(planet_model_low)
         if planet_texture:
             pr.unload_texture(planet_texture)
         if bg_anim:
