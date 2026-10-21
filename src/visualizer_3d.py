@@ -1,5 +1,7 @@
+import glob
 import math
 import os
+import random
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -461,8 +463,8 @@ class Visualizer3D:
 
     def _load_planet_model(self, low_detail: bool = False) -> Any:
         """Charge un modèle; les grandes cartes peuvent utiliser planet_low.glb."""
-        normal_path = os.path.join("assets", "planet_3.glb")
-        low_path = os.path.join("assets", "planet_low.glb")
+        normal_path = os.path.join("assets", "planet_0.glb")
+        low_path = os.path.join("assets", "planet_3.glb")
         path = low_path if low_detail and os.path.exists(low_path) else normal_path
         if os.path.exists(path):
             try:
@@ -1024,29 +1026,60 @@ class Visualizer3D:
                 print(f"⚠ Erreur vidéo intro : {e}")
 
         # ASSETS 3D
-        # Le modèle détaillé et le modèle léger sont chargés une fois ; le
-        # choix se fait à chaque image selon la carte courante (changer de
-        # carte depuis le menu garde ainsi le bon modèle).
+        # Le modèle principal sert aux petites cartes et aux hubs.
+        # Sur les grandes cartes, les autres planet*.glb sont répartis
+        # aléatoirement entre les zones non-hubs.
         planet_model = self._load_planet_model()
-        planet_model_low = None
-        if os.path.exists(os.path.join("assets", "planet_low.glb")):
-            planet_model_low = self._load_planet_model(low_detail=True)
-        if planet_model is None:
-            planet_model, planet_model_low = planet_model_low, None
-        planet_shader = PlanetShader.create() if planet_model else None
+        planet_models_low: List[Any] = []
+        main_planet_path = os.path.normpath(
+            os.path.join("assets", "planet_0.glb")
+        )
+
+        for model_path in sorted(
+            glob.glob(os.path.join("assets", "planet*.glb"))
+        ):
+            # planet_0.glb reste le modèle principal ; ne pas le recharger.
+            if os.path.normpath(model_path) == main_planet_path:
+                continue
+            try:
+                loaded_model = pr.load_model(model_path)
+                planet_models_low.append(loaded_model)
+                print(f"Planète variante chargée : {model_path}")
+            except Exception as error:
+                print(
+                    f"⚠ Impossible de charger la planète {model_path} : "
+                    f"{error}"
+                )
+
+        planet_shader = (
+            PlanetShader.create()
+            if planet_model is not None or planet_models_low
+            else None
+        )
         if planet_shader is not None:
             try:
-                for loaded_model in (planet_model, planet_model_low):
-                    if loaded_model is not None:
-                        planet_shader.apply(loaded_model)
+                if planet_model is not None:
+                    planet_shader.apply(planet_model)
+                for loaded_model in planet_models_low:
+                    planet_shader.apply(loaded_model)
             except Exception as error:
-                print(f"⚠ Shader de planète désactivé, rendu standard conservé : {error}")
+                print(
+                    "⚠ Shader de planète désactivé, "
+                    f"rendu standard conservé : {error}"
+                )
                 try:
                     planet_shader.unload()
                 except Exception:
                     pass
                 planet_shader = None
-        planet_texture = None if planet_model else self._load_planet_texture()
+
+        planet_texture = (
+            None if planet_model is not None else self._load_planet_texture()
+        )
+
+        # Chaque zone garde la même variante pendant le rendu, plutôt que de
+        # changer de planète à chaque image.
+        low_planet_by_zone: Dict[str, Any] = {}
 
         # Fond : abstract.glb (animé) en priorité, sinon abstract.jpg (image fixe)
         bg_anim = None
@@ -1241,8 +1274,12 @@ class Visualizer3D:
                         is_hub = True
 
                     model = planet_model
-                    if planet_model_low is not None and low_detail_map and not is_hub:
-                        model = planet_model_low
+                    if low_detail_map and not is_hub and planet_models_low:
+                        if zone_name not in low_planet_by_zone:
+                            low_planet_by_zone[zone_name] = random.choice(
+                                planet_models_low
+                            )
+                        model = low_planet_by_zone[zone_name]
 
                     if model:
                         # Planète 3D : diamètre = size, rotation lente décalée par zone
@@ -1385,10 +1422,10 @@ class Visualizer3D:
             pr.unload_model(drone_model)
         if planet_shader is not None:
             planet_shader.unload()
-        if planet_model:
+        if planet_model is not None:
             pr.unload_model(planet_model)
-        if planet_model_low:
-            pr.unload_model(planet_model_low)
+        for loaded_model in planet_models_low:
+            pr.unload_model(loaded_model)
         if planet_texture:
             pr.unload_texture(planet_texture)
         if bg_anim:
